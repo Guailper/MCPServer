@@ -1,111 +1,120 @@
-"""Embedding providers for standalone RAG."""
+"""基于 LangChain 的 Embedding 封装。"""
 
 from __future__ import annotations
 
-import hashlib
-import math
-import re
+from collections.abc import Sequence
+from typing import Any
 
-import httpx
+from langchain_core.embeddings import Embeddings
 
 from rag_mcp.config import Settings
 
 
 class EmbeddingClient:
-    """Generate embeddings with a zero-dependency hash provider or an API provider."""
+    """统一管理查询和文档的向量化。
+
+    这里显式使用 LangChain 的 Embeddings 接口，后续无论切换到本地
+    HuggingFace 模型、OpenAI 兼容接口，还是其他 LangChain 支持的模型，
+    索引和检索流程都不需要改动。
+    """
 
     def __init__(self, settings: Settings) -> None:
+        """初始化 Embedding 客户端。
+
+        Args:
+            settings: RAG MCP 的运行配置。
+        """
+
         self.settings = settings
-        self._local_client = None
+        self._embedding_model: Embeddings | None = None
 
-    def embed_query(self, text: str) -> list[float]:
-        return self.embed_documents([text])[0]
+    def embed_query(self, query: str) -> list[float]:
+        """生成单条查询文本的向量。
 
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        Args:
+            query: 用户问题或检索语句。
+
+        Returns:
+            查询文本对应的浮点向量。
+        """
+
+        return self._to_float_list(self._get_model().embed_query(query))
+
+    def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
+        """批量生成文档 chunk 的向量。
+
+        Args:
+            texts: 待向量化的 chunk 文本序列。
+
+        Returns:
+            与输入顺序一致的向量列表。
+        """
+
         if not texts:
             return []
 
-        provider = self.settings.embedding_provider
-        if provider == "hash":
-            return [self._hash_embed(text) for text in texts]
-        if provider == "sentence_transformers":
-            return self._embed_with_sentence_transformers(texts)
-        if provider in {"openai", "openai_compatible", "api"}:
-            return self._embed_with_openai_compatible_api(texts)
-
-        raise ValueError(f"未知 embedding provider：{provider}")
-
-    def _hash_embed(self, text: str) -> list[float]:
-        dimensions = self.settings.embedding_dimensions
-        vector = [0.0] * dimensions
-        tokens = self._tokenize(text)
-
-        for token in tokens:
-            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-            bucket = int.from_bytes(digest[:4], "big") % dimensions
-            sign = 1.0 if digest[4] % 2 == 0 else -1.0
-            vector[bucket] += sign
-
-        return self._normalize(vector)
-
-    def _tokenize(self, text: str) -> list[str]:
-        lowered_text = text.lower()
-        words = re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]", lowered_text)
-        if words:
-            return words
-
-        return [character for character in lowered_text if not character.isspace()]
-
-    def _embed_with_sentence_transformers(self, texts: list[str]) -> list[list[float]]:
-        if self._local_client is None:
-            try:
-                from sentence_transformers import SentenceTransformer
-            except ImportError as exc:
-                raise RuntimeError(
-                    "缺少 sentence-transformers，请安装："
-                    "python -m pip install -e .[local-embedding]"
-                ) from exc
-
-            self._local_client = SentenceTransformer(self.settings.embedding_model)
-
-        vectors = self._local_client.encode(texts, normalize_embeddings=True)
+        vectors = self._get_model().embed_documents(list(texts))
         return [self._to_float_list(vector) for vector in vectors]
 
-    def _embed_with_openai_compatible_api(self, texts: list[str]) -> list[list[float]]:
+    def _get_model(self) -> Embeddings:
+        if self._embedding_model is not None:
+            return self._embedding_model
+
+        provider = self.settings.embedding_provider
+        if provider in {"local", "local_huggingface", "huggingface"}:
+            self._embedding_model = self._build_huggingface_embedding()
+            return self._embedding_model
+
+        if provider in {"openai", "openai_compatible", "api"}:
+            self._embedding_model = self._build_openai_embedding()
+            return self._embedding_model
+
+        raise ValueError(f"不支持的 RAG_EMBEDDING_PROVIDER：{provider}")
+
+    def _build_huggingface_embedding(self) -> Embeddings:
+        """创建本地 HuggingFace Embedding 模型。
+
+        Returns:
+            HuggingFaceEmbeddings 实例。
+        """
+
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+        except ImportError as exc:
+            raise RuntimeError("缺少 langchain-huggingface 依赖，无法加载本地 embedding 模型。") from exc
+
+        # 使用本地路径优先，避免启动 MCP 时重复从网络拉取模型。
+        return HuggingFaceEmbeddings(
+            model_name=self.settings.embedding_model_path,
+            encode_kwargs={"normalize_embeddings": self.settings.embedding_normalize},
+        )
+
+    def _build_openai_embedding(self) -> Embeddings:
+        """创建 OpenAI 兼容接口的 Embedding 模型。
+
+        Returns:
+            LangChain OpenAIEmbeddings 实例。
+        """
+
         if not self.settings.embedding_base_url or not self.settings.embedding_api_key:
-            raise RuntimeError(
-                "OpenAI-compatible embedding 未配置，请设置 "
-                "RAG_EMBEDDING_BASE_URL 和 RAG_EMBEDDING_API_KEY。"
-            )
+            raise RuntimeError("使用 OpenAI 兼容 embedding 时必须配置 RAG_EMBEDDING_BASE_URL 和 RAG_EMBEDDING_API_KEY。")
 
-        url = f"{self.settings.embedding_base_url.rstrip('/')}/embeddings"
-        headers = {"Authorization": f"Bearer {self.settings.embedding_api_key}"}
-        payload = {
-            "model": self.settings.embedding_model,
-            "input": texts,
-        }
+        try:
+            from langchain_openai import OpenAIEmbeddings
+        except ImportError as exc:
+            raise RuntimeError("缺少 langchain-openai 依赖，无法调用 OpenAI 兼容 embedding。") from exc
 
-        with httpx.Client(timeout=self.settings.embedding_timeout_seconds) as client:
-            response = client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+        return OpenAIEmbeddings(
+            model=self.settings.embedding_model,
+            api_key=self.settings.embedding_api_key,
+            base_url=self.settings.embedding_base_url.rstrip("/"),
+            timeout=self.settings.request_timeout_seconds,
+        )
 
-        vectors_by_index: dict[int, list[float]] = {}
-        for item in data.get("data", []):
-            index = int(item.get("index", len(vectors_by_index)))
-            vectors_by_index[index] = self._normalize(self._to_float_list(item["embedding"]))
+    def _to_float_list(self, vector: Any) -> list[float]:
+        """把 numpy、torch 或普通列表统一转换为 Python float 列表。"""
 
-        return [vectors_by_index[index] for index in range(len(texts))]
-
-    def _to_float_list(self, vector) -> list[float]:
         if hasattr(vector, "tolist"):
             vector = vector.tolist()
 
         return [float(value) for value in vector]
-
-    def _normalize(self, vector: list[float]) -> list[float]:
-        norm = math.sqrt(sum(value * value for value in vector))
-        if norm == 0:
-            return vector
-
-        return [value / norm for value in vector]
