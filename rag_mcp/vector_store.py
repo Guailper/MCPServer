@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from typing import Any
+from urllib.parse import urlparse
 
 from rag_mcp.config import Settings
 from rag_mcp.schemas import SearchResult, TextChunk
@@ -73,9 +74,13 @@ class MilvusVectorStore:
     def search(
         self,
         query_embedding: list[float],
+        query_text: str,
         knowledge_base_ids: list[str],
         top_k: int,
         min_score: float,
+        search_mode: str = "hybrid",
+        dense_weight: float = 0.7,
+        sparse_weight: float = 0.3,
     ) -> list[SearchResult]:
         """在指定知识库中执行向量相似度检索。
 
@@ -96,25 +101,31 @@ class MilvusVectorStore:
         collection_name = self.settings.milvus_collection
         if not client.has_collection(collection_name):
             return []
+        self._validate_collection_schema(collection_name)
 
-        results = client.search(
-            collection_name=collection_name,
-            data=[query_embedding],
-            anns_field="embedding",
-            limit=max(1, top_k),
-            filter=self._build_kb_filter(knowledge_base_ids),
-            output_fields=[
-                "chunk_public_id",
-                "knowledge_base_public_id",
-                "document_public_id",
-                "document_title",
-                "chunk_index",
-                "page_no",
-                "content",
-                "metadata_json",
-            ],
-            search_params={"metric_type": "COSINE"},
-        )
+        if search_mode == "hybrid":
+            results = self._hybrid_search(
+                query_embedding=query_embedding,
+                query_text=query_text,
+                knowledge_base_ids=knowledge_base_ids,
+                top_k=top_k,
+                dense_weight=dense_weight,
+                sparse_weight=sparse_weight,
+            )
+        elif search_mode == "sparse":
+            results = self._sparse_search(
+                query_text=query_text,
+                knowledge_base_ids=knowledge_base_ids,
+                top_k=top_k,
+            )
+        elif search_mode == "dense":
+            results = self._dense_search(
+                query_embedding=query_embedding,
+                knowledge_base_ids=knowledge_base_ids,
+                top_k=top_k,
+            )
+        else:
+            raise ValueError(f"不支持的检索模式：{search_mode}")
 
         search_results: list[SearchResult] = []
         for item in results[0] if results else []:
@@ -188,7 +199,9 @@ class MilvusVectorStore:
         client = self._get_client()
         collection_name = self.settings.milvus_collection
         if client.has_collection(collection_name):
-            return
+            if not self._missing_schema_fields(collection_name):
+                return
+            client.drop_collection(collection_name)
 
         from pymilvus import DataType
 
@@ -200,15 +213,22 @@ class MilvusVectorStore:
         schema.add_field("document_title", DataType.VARCHAR, max_length=512)
         schema.add_field("chunk_index", DataType.INT64)
         schema.add_field("page_no", DataType.INT64)
-        schema.add_field("content", DataType.VARCHAR, max_length=65535)
+        schema.add_field("content", DataType.VARCHAR, max_length=65535, enable_analyzer=True)
         schema.add_field("metadata_json", DataType.VARCHAR, max_length=65535)
-        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=vector_dim)
+        schema.add_field("dense_embedding", DataType.FLOAT_VECTOR, dim=vector_dim)
+        schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
+        self._add_bm25_function(schema)
 
         index_params = client.prepare_index_params()
         index_params.add_index(
-            field_name="embedding",
+            field_name="dense_embedding",
             index_type="AUTOINDEX",
             metric_type="COSINE",
+        )
+        index_params.add_index(
+            field_name="sparse_embedding",
+            index_type="SPARSE_INVERTED_INDEX",
+            metric_type="BM25",
         )
 
         client.create_collection(
@@ -224,17 +244,23 @@ class MilvusVectorStore:
         client = self._get_client()
         collection_name = self.settings.milvus_collection
         exists = client.has_collection(collection_name)
+        missing_schema_fields = self._missing_schema_fields(collection_name) if exists else []
         return {
             "milvus_uri": self.settings.milvus_uri,
+            "milvus_deployment_mode": self.settings.milvus_deployment_mode,
             "milvus_database": self.settings.milvus_database,
             "collection": collection_name,
             "collection_exists": exists,
+            "collection_schema_compatible": exists and not missing_schema_fields,
+            "missing_schema_fields": missing_schema_fields,
+            "hybrid_search_supported": exists and self._supports_sparse_search(collection_name),
         }
 
     def _get_client(self):
         if self._client is not None:
             return self._client
 
+        self._validate_connection_config()
         try:
             from pymilvus import MilvusClient
         except ImportError as exc:
@@ -247,6 +273,25 @@ class MilvusVectorStore:
             timeout=self.settings.request_timeout_seconds,
         )
         return self._client
+
+    def _validate_connection_config(self) -> None:
+        mode = self.settings.milvus_deployment_mode
+        if mode != "standalone":
+            raise ValueError(f"当前 RAG MCP 仅按 Milvus Standalone 配置运行，不支持的 MILVUS_DEPLOYMENT_MODE：{mode}")
+
+        uri = self.settings.milvus_uri.strip()
+        parsed_uri = urlparse(uri)
+        normalized_uri = uri.replace("\\", "/").lower()
+        looks_like_local_file = (
+            parsed_uri.scheme == "file"
+            or normalized_uri.endswith((".db", ".sqlite", ".sqlite3"))
+            or (not parsed_uri.scheme and "/" in normalized_uri)
+        )
+        if looks_like_local_file:
+            raise ValueError(
+                "当前配置为 Milvus Standalone，请将 MILVUS_URI 设置为服务地址，"
+                "例如 http://127.0.0.1:19530，不要使用本地 .db 文件路径。"
+            )
 
     def _to_milvus_row(self, chunk: TextChunk, embedding: list[float]) -> dict[str, Any]:
         metadata = {
@@ -262,8 +307,127 @@ class MilvusVectorStore:
             "page_no": chunk.page_no or 0,
             "content": chunk.content,
             "metadata_json": json.dumps(metadata, ensure_ascii=False),
-            "embedding": embedding,
+            "dense_embedding": embedding,
         }
+
+    def _dense_search(
+        self,
+        query_embedding: list[float],
+        knowledge_base_ids: list[str],
+        top_k: int,
+    ) -> list[list[dict[str, Any]]]:
+        return self._get_client().search(
+            collection_name=self.settings.milvus_collection,
+            data=[query_embedding],
+            anns_field="dense_embedding",
+            limit=max(1, top_k),
+            filter=self._build_kb_filter(knowledge_base_ids),
+            output_fields=self._output_fields(),
+            search_params={"metric_type": "COSINE"},
+        )
+
+    def _sparse_search(
+        self,
+        query_text: str,
+        knowledge_base_ids: list[str],
+        top_k: int,
+    ) -> list[list[dict[str, Any]]]:
+        return self._get_client().search(
+            collection_name=self.settings.milvus_collection,
+            data=[query_text],
+            anns_field="sparse_embedding",
+            limit=max(1, top_k),
+            filter=self._build_kb_filter(knowledge_base_ids),
+            output_fields=self._output_fields(),
+            search_params={"metric_type": "BM25"},
+        )
+
+    def _hybrid_search(
+        self,
+        query_embedding: list[float],
+        query_text: str,
+        knowledge_base_ids: list[str],
+        top_k: int,
+        dense_weight: float,
+        sparse_weight: float,
+    ) -> list[list[dict[str, Any]]]:
+        from pymilvus import AnnSearchRequest, WeightedRanker
+
+        dense_request = AnnSearchRequest(
+            data=[query_embedding],
+            anns_field="dense_embedding",
+            param={"metric_type": "COSINE"},
+            limit=max(1, top_k),
+            expr=self._build_kb_filter(knowledge_base_ids),
+        )
+        sparse_request = AnnSearchRequest(
+            data=[query_text],
+            anns_field="sparse_embedding",
+            param={"metric_type": "BM25"},
+            limit=max(1, top_k),
+            expr=self._build_kb_filter(knowledge_base_ids),
+        )
+        ranker = WeightedRanker(float(dense_weight), float(sparse_weight))
+        return self._get_client().hybrid_search(
+            collection_name=self.settings.milvus_collection,
+            reqs=[dense_request, sparse_request],
+            ranker=ranker,
+            limit=max(1, top_k),
+            output_fields=self._output_fields(),
+        )
+
+    def _output_fields(self) -> list[str]:
+        return [
+            "chunk_public_id",
+            "knowledge_base_public_id",
+            "document_public_id",
+            "document_title",
+            "chunk_index",
+            "page_no",
+            "content",
+            "metadata_json",
+        ]
+
+    def _supports_sparse_search(self, collection_name: str) -> bool:
+        return self._field_exists(collection_name, "sparse_embedding")
+
+    def _validate_collection_schema(self, collection_name: str) -> None:
+        missing_fields = self._missing_schema_fields(collection_name)
+        if missing_fields:
+            missing_text = ", ".join(missing_fields)
+            raise RuntimeError(
+                f"Milvus collection {collection_name!r} 使用的是旧 schema，缺少字段：{missing_text}。"
+                "请先执行入库操作，服务会自动按新 schema 重建该 collection。"
+            )
+
+    def _missing_schema_fields(self, collection_name: str) -> list[str]:
+        required_fields = {"dense_embedding", "sparse_embedding", "content"}
+        return sorted(field for field in required_fields if not self._field_exists(collection_name, field))
+
+    def _field_exists(self, collection_name: str, field_name: str) -> bool:
+        try:
+            description = self._get_client().describe_collection(collection_name)
+        except Exception:
+            return False
+
+        fields = description.get("fields", []) if isinstance(description, dict) else []
+        return any(
+            field.get("name") == field_name or field.get("field_name") == field_name
+            for field in fields
+            if isinstance(field, dict)
+        )
+
+    def _add_bm25_function(self, schema: Any) -> None:
+        from pymilvus import Function, FunctionType
+
+        schema.add_function(
+            Function(
+                name="content_bm25",
+                input_field_names=["content"],
+                output_field_names=["sparse_embedding"],
+                function_type=FunctionType.BM25,
+            )
+        )
 
     def _to_text_chunk(self, row: dict[str, Any]) -> TextChunk:
         metadata_json = row.get("metadata_json") or "{}"

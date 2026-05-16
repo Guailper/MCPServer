@@ -86,6 +86,7 @@ class EmbeddingClient:
         # 使用本地路径优先，避免启动 MCP 时重复从网络拉取模型。
         return HuggingFaceEmbeddings(
             model_name=self.settings.embedding_model_path,
+            model_kwargs={"device": self.settings.model_device},
             encode_kwargs={"normalize_embeddings": self.settings.embedding_normalize},
         )
 

@@ -16,7 +16,14 @@ from rag_mcp.vector_store import MilvusVectorStore
 class RagIndexer:
     """协调文档读取、分块、向量化和 Milvus 写入。"""
 
-    def __init__(self, settings: Settings, store: MilvusVectorStore) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        store: MilvusVectorStore,
+        loader: DocumentLoader | None = None,
+        chunker: TextChunker | None = None,
+        embedding_client: EmbeddingClient | None = None,
+    ) -> None:
         """初始化索引器。
 
         Args:
@@ -26,9 +33,9 @@ class RagIndexer:
 
         self.settings = settings
         self.store = store
-        self.loader = DocumentLoader(settings)
-        self.chunker = TextChunker(settings)
-        self.embedding_client = EmbeddingClient(settings)
+        self.loader = loader or DocumentLoader(settings)
+        self.chunker = chunker or TextChunker(settings)
+        self.embedding_client = embedding_client or EmbeddingClient(settings)
 
     def index_path(
         self,
@@ -102,6 +109,16 @@ class RagIndexer:
             for document in documents
             for chunk in self.chunker.split(document, knowledge_base_id)
         ]
+        if not chunks:
+            return {
+                "ok": True,
+                "knowledge_base_id": knowledge_base_id,
+                "documents": len(documents),
+                "chunks": 0,
+                "stored_chunks": 0,
+                "collection": self.settings.milvus_collection,
+            }
+
         embeddings = self.embedding_client.embed_documents([chunk.content for chunk in chunks])
         store_result = self.store.upsert_chunks(
             chunks=chunks,

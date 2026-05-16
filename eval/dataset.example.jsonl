@@ -1,0 +1,2 @@
+{"question":"油焖大虾需要哪些主要调料？","reference":"油焖大虾常用姜、蒜、生抽、老抽、料酒、白糖等调料。","expected_source_paths":["油焖大虾"],"reference_contexts":["油焖大虾的调料通常包括姜、蒜、生抽、老抽、料酒、白糖等。"]}
+{"question":"戚风蛋糕打发蛋白时要注意什么？","reference":"打发蛋白时容器要无油无水，分次加糖，打到配方要求的状态。","expected_source_paths":["戚风蛋糕"],"reference_contexts":["戚风蛋糕制作时，蛋白打发需要无油无水的容器，并按状态分次加糖。"]}

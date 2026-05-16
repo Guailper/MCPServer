@@ -121,6 +121,7 @@ class Settings:
     milvus_token: str
     milvus_database: str
     milvus_collection: str
+    milvus_deployment_mode: str
 
     default_knowledge_base_ids: list[str]
     supported_extensions: set[str]
@@ -133,6 +134,15 @@ class Settings:
     vector_top_k: int
     final_top_k: int
     min_score: float
+    search_mode: str
+    dense_weight: float
+    sparse_weight: float
+    rerank_enabled: bool
+    rerank_provider: str
+    rerank_model: str
+    rerank_model_path: str
+    rerank_top_n: int
+    model_device: str
     request_timeout_seconds: int
     list_limit: int
 
@@ -158,7 +168,7 @@ def get_settings() -> Settings:
         extension.lower()
         for extension in _get_csv_env(
             "RAG_SUPPORTED_EXTENSIONS",
-            [".txt", ".md", ".markdown"],
+            [".txt", ".md", ".markdown", ".pdf", ".docx", ".html", ".htm", ".csv", ".xlsx", ".json", ".jsonl"],
         )
     }
 
@@ -169,6 +179,7 @@ def get_settings() -> Settings:
         milvus_token=os.getenv("MILVUS_TOKEN", "").strip(),
         milvus_database=os.getenv("MILVUS_DATABASE", os.getenv("MILVUS_DB", "default")).strip(),
         milvus_collection=os.getenv("MILVUS_COLLECTION", "rag_chunks").strip(),
+        milvus_deployment_mode=os.getenv("MILVUS_DEPLOYMENT_MODE", os.getenv("MILVUS_MODE", "standalone")).strip().lower(),
         default_knowledge_base_ids=default_kb_ids or ["default"],
         supported_extensions=supported_extensions,
         max_file_size_bytes=max(1024, _get_int_env("RAG_MAX_FILE_SIZE_BYTES", 2_000_000)),
@@ -178,6 +189,19 @@ def get_settings() -> Settings:
         vector_top_k=max(1, _get_int_env("RAG_VECTOR_TOP_K", 20)),
         final_top_k=max(1, _get_int_env("RAG_FINAL_TOP_K", 5)),
         min_score=_get_float_env("RAG_MIN_SCORE", 0.25),
+        search_mode=os.getenv("RAG_SEARCH_MODE", "hybrid").strip().lower(),
+        dense_weight=max(0.0, _get_float_env("RAG_DENSE_WEIGHT", 0.7)),
+        sparse_weight=max(0.0, _get_float_env("RAG_SPARSE_WEIGHT", 0.3)),
+        rerank_enabled=_get_bool_env("RAG_RERANK_ENABLED", True),
+        rerank_provider=os.getenv("RAG_RERANK_PROVIDER", "local_cross_encoder").strip().lower(),
+        rerank_model=os.getenv("RAG_RERANK_MODEL", "BAAI/bge-reranker-base").strip(),
+        rerank_model_path=str(
+            _resolve_path(
+                os.getenv("LOCAL_RERANK_MODEL_PATH", "../models/bge-reranker-base").strip()
+            )
+        ),
+        rerank_top_n=max(1, _get_int_env("RAG_RERANK_TOP_N", 50)),
+        model_device=os.getenv("RAG_MODEL_DEVICE", os.getenv("MODEL_DEVICE", "cuda")).strip().lower(),
         request_timeout_seconds=max(1, _get_int_env("RAG_REQUEST_TIMEOUT_SECONDS", 30)),
         list_limit=max(100, _get_int_env("RAG_LIST_LIMIT", 10_000)),
         embedding_provider=os.getenv(
@@ -187,10 +211,7 @@ def get_settings() -> Settings:
 
         embedding_model=os.getenv("RAG_EMBEDDING_MODEL", os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5")).strip(),
         embedding_model_path=str(
-            _resolve_path(
-                os.getenv(
-                    "LOCAL_EMBEDDING_MODEL_PATH", "../models/bge-small-zh-v1.5"),
-                ).strip()
+            _resolve_path(os.getenv("LOCAL_EMBEDDING_MODEL_PATH", "../models/bge-small-zh-v1.5").strip())
         ),
         embedding_base_url=os.getenv("RAG_EMBEDDING_BASE_URL", "").strip(),
         embedding_api_key=os.getenv("RAG_EMBEDDING_API_KEY", "").strip(),
